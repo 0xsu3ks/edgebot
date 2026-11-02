@@ -291,6 +291,44 @@ def _rec(frame):
 
 # ---------- angles --------------------------------------------------------
 
+def _ats(frame):
+    n = len(frame)
+    if n == 0:
+        return "0-0"
+    cov = frame["covered"].dropna()
+    w = int((cov == True).sum())   # noqa: E712
+    l = int((cov == False).sum())  # noqa: E712
+    p = int(frame["covered"].isna().sum())
+    pct = _pct(w, w + l)
+    return f"{w}-{l}" + (f"-{p}" if p else "") + (f" ({pct}%)" if pct is not None else "")
+
+
+def _coach_frame(pl, coach):
+    home = pl[pl["home_coach"] == coach].copy()
+    away = pl[pl["away_coach"] == coach].copy()
+    home["ats_margin"] = home["result"] - home["spread_line"]
+    home["rest"] = home["home_rest"]
+    home["team_spread"] = home["spread_line"]        # >0 = this coach's team favored
+    away["ats_margin"] = -(away["result"] - away["spread_line"])
+    away["rest"] = away["away_rest"]
+    away["team_spread"] = -away["spread_line"]
+    q = pd.concat([home, away], ignore_index=True)
+    if q.empty:
+        return q
+    q["covered"] = q["ats_margin"].apply(lambda m: None if abs(m) < 1e-9 else (m > 0))
+    return q.sort_values("gameday")
+
+
+def coach_splits(pl, coach):
+    if not isinstance(coach, str) or not coach:
+        return None
+    q = _coach_frame(pl, coach)
+    if q.empty:
+        return None
+    return {"coach": coach, "career": _ats(q), "off_bye": _ats(q[q["rest"] >= 13]),
+            "as_dog": _ats(q[q["team_spread"] < 0]), "last10": _ats(q.tail(10))}
+
+
 def line_summary(game):
     sl = game["spread_line"]
     home, away = game["home_team"], game["away_team"]
@@ -600,6 +638,16 @@ def build_dossier(df, game, odds_map=None, inj_map=None, srs_map=None):
         o += [_recline("  Career", hqb["career"]), _recline("  As home QB", hqb["as_home"]),
               _recline("  Off a bye", hqb["off_bye"]), _recline("  Short week", hqb["short_week"]),
               _recline("  Last 10", hqb["last_10"])]
+    o.append("\n**Coaches (ATS)**")
+    for team, coach in ((game["away_team"], game.get("away_coach")),
+                        (game["home_team"], game.get("home_coach"))):
+        cs = coach_splits(pl, coach)
+        if cs:
+            o.append(f"- {team} — {cs['coach']}: career {cs['career']} · off bye {cs['off_bye']} · "
+                     f"as dog {cs['as_dog']} · last 10 {cs['last10']}")
+        else:
+            o.append(f"- {team} — {coach}: no ATS history in data")
+
     o.append("\n**Head-to-head**")
     if h2h["n"] == 0:
         o.append("- none in dataset")

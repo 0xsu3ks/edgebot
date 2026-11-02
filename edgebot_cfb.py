@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
 import statistics
 import sys
 
@@ -77,8 +78,98 @@ def load_season(year, season_type="regular"):
         rec = {g(x, "team"): x for x in _get("/records", year=year)}
     except Exception:
         rec = {}
+    try:
+        teams_loc = {g(x, "school", "team"): (g(x, "location") or {}) for x in _get("/teams", year=year)}
+    except Exception:
+        teams_loc = {}
     lines_by_id = {g(x, "id"): x for x in lines}
-    return {"games": games, "lines_by_id": lines_by_id, "sp": sp, "rec": rec, "year": year}
+    return {"games": games, "lines_by_id": lines_by_id, "sp": sp, "rec": rec,
+            "teams_loc": teams_loc, "year": year}
+
+
+_NWS_HDRS = {"User-Agent": "edgebot/1.0 (research)", "Accept": "application/geo+json"}
+
+
+def _offset_hours(loc, kick):
+    """UTC offset (hours) for a team location at kickoff — IANA tz if present, else longitude/15."""
+    tz = g(loc, "timezone")
+    if tz:
+        try:
+            return kick.astimezone(ZoneInfo(tz)).utcoffset().total_seconds() / 3600.0
+        except Exception:
+            pass
+    lng = g(loc, "longitude")
+    if lng is not None:
+        try:
+            return round(float(lng) / 15.0)
+        except Exception:
+            pass
+    return None
+
+
+def compute_travel(season, home, away, start_iso, neutral):
+    """Road-team TZ crossing + body-clock kickoff. Fail-safe -> None."""
+    if neutral:
+        return None
+    tl = season.get("teams_loc") or {}
+    h, a = tl.get(home), tl.get(away)
+    if not h or not a:
+        return None
+    try:
+        kick = dt.datetime.fromisoformat(str(start_iso).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    ho, ao = _offset_hours(h, kick), _offset_hours(a, kick)
+    if ho is None or ao is None:
+        return None
+    zones = round(ho - ao)
+    if zones == 0:
+        return f"{away} in-zone (no TZ change)"
+    direction = "EAST" if zones > 0 else "WEST"
+    body_hour = (kick + dt.timedelta(hours=ao)).hour
+    note = f"{away} travels {abs(zones)} TZ {direction}; body-clock kickoff ~{body_hour}:00"
+    if zones >= 2 and body_hour < 11:
+        note += " · ⚠ early body clock for road team (West→East early window)"
+    return note
+
+
+def fetch_weather_cfb(season, home, start_iso):
+    """NWS game-time forecast for an outdoor home venue (US only). Fail-safe -> None."""
+    loc = (season.get("teams_loc") or {}).get(home) or {}
+    if g(loc, "dome"):
+        return None
+    lat, lng = g(loc, "latitude"), g(loc, "longitude")
+    if requests is None or lat is None or lng is None:
+        return None
+    try:
+        pt = requests.get(f"https://api.weather.gov/points/{lat},{lng}", headers=_NWS_HDRS, timeout=12)
+        if pt.status_code != 200:
+            return None
+        hurl = pt.json()["properties"]["forecastHourly"]
+        periods = requests.get(hurl, headers=_NWS_HDRS, timeout=12).json()["properties"]["periods"]
+        kick = dt.datetime.fromisoformat(str(start_iso).replace("Z", "+00:00"))
+        best, bd = None, None
+        for p in periods:
+            try:
+                ts = dt.datetime.fromisoformat(p["startTime"])
+            except Exception:
+                continue
+            d = abs((ts - kick).total_seconds())
+            if bd is None or d < bd:
+                best, bd = p, d
+        if not best:
+            return None
+        wnums = re.findall(r"\d+", str(best.get("windSpeed") or ""))
+        wmph = max(int(n) for n in wnums) if wnums else None
+        pop = (best.get("probabilityOfPrecipitation") or {}).get("value")
+        txt = (f"{best.get('temperature')}°{best.get('temperatureUnit','F')}, "
+               f"wind {best.get('windSpeed')} {best.get('windDirection','')}, "
+               f"{'' if pop is None else str(pop)+'% precip, '}{best.get('shortForecast','')}")
+        if wmph is not None and wmph >= 15:
+            txt += f"  ⚠ WIND {wmph} mph — strong Under signal"
+        return txt
+    except Exception:
+        return None
 
 
 # ---------- angle helpers -------------------------------------------------
@@ -189,7 +280,13 @@ def build_dossier(season, gm):
              f"{home} {hrec['overall'] if hrec else '?'} (conf {hrec['conf'] if hrec else '?'})")
     o.append(f"**Recent — {away}:** " + ("; ".join(aform) if aform else "n/a"))
     o.append(f"**Recent — {home}:** " + ("; ".join(hform) if hform else "n/a"))
-    o.append("\n_Data: CollegeFootballData (SP+, lines, records). QB situational "
+    tv = compute_travel(season, home, away, g(gm, "startDate", "start_date"), neutral)
+    if tv:
+        o.append(f"**Travel / body clock:** {tv}")
+    wx = fetch_weather_cfb(season, home, g(gm, "startDate", "start_date"))
+    if wx:
+        o.append(f"**Weather (game-time):** {wx}")
+    o.append("\n_Data: CollegeFootballData (SP+, lines, records) + NWS weather. QB situational "
              "splits not available for CFB. Any pick is an opinion, not a wager or advice._")
     return "\n".join(o), gid, f"{away}_at_{home}"
 
