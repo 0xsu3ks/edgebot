@@ -71,7 +71,35 @@ def _rest_label(days):
         return f"off bye ({days}d)"
     if days <= 5:
         return f"short week ({days}d)"
+    if days >= 8:
+        return f"extra rest ({days}d)"
     return f"normal ({days}d)"
+
+
+def _rest_bucket(days):
+    """(key, label) for a rest-day count; buckets match qb_splits filters."""
+    if pd.isna(days):
+        return None, "unknown rest"
+    days = int(days)
+    if days >= 13:
+        return "off_bye", f"off a bye ({days}d)"
+    if days <= 5:
+        return "short", f"short week ({days}d)"
+    if days >= 8:
+        return "extra", f"extra rest ({days}d)"
+    return "normal", f"normal rest ({days}d)"
+
+
+def _bucket_frame(q, key):
+    if key == "off_bye":
+        return q[q["rest"] >= 13]
+    if key == "short":
+        return q[q["rest"] <= 5]
+    if key == "extra":
+        return q[(q["rest"] >= 8) & (q["rest"] <= 12)]
+    if key == "normal":
+        return q[(q["rest"] >= 6) & (q["rest"] <= 7)]
+    return q.iloc[0:0]
 
 
 def _qb_frame(pl, qb):
@@ -149,15 +177,19 @@ def rest_edge(game):
     return {"away": (game["away_team"], _rest_label(ar)), "home": (game["home_team"], _rest_label(hr)), "note": note}
 
 
-def qb_splits(pl, qb, side):
+def qb_splits(pl, qb, side, this_rest=None):
     if not isinstance(qb, str) or not qb:
         return {"qb": qb, "note": "no QB listed"}
     q = _qb_frame(pl, qb)
     if q.empty:
         return {"qb": qb, "note": "no completed starts in dataset"}
     this_side = q[q["is_home"]] if side == "home" else q[q["is_home"] == False]  # noqa: E712
+    # THIS-SPOT: the QB's record in the rest situation that applies to THIS game
+    bkey, blabel = _rest_bucket(this_rest)
+    this_spot = _rec(_bucket_frame(q, bkey)) if bkey else {"games": 0}
     return {
         "qb": qb, "career": _rec(q), f"as_{side}": _rec(this_side),
+        "this_spot": this_spot, "this_spot_label": blabel,
         "off_bye": _rec(q[q["rest"] >= 13]), "short_week": _rec(q[q["rest"] <= 5]),
         "last_10": _rec(q.tail(10)), "side": side,
     }
@@ -223,8 +255,8 @@ def build_dossier(df, game):
     rest = rest_edge(game)
     h2h = head_to_head(pl, game["home_team"], game["away_team"])
     ref = referee_tendency(pl, game.get("referee"))
-    aqb = qb_splits(pl, game.get("away_qb_name"), "away")
-    hqb = qb_splits(pl, game.get("home_qb_name"), "home")
+    aqb = qb_splits(pl, game.get("away_qb_name"), "away", game.get("away_rest"))
+    hqb = qb_splits(pl, game.get("home_qb_name"), "home", game.get("home_rest"))
     o = []
     o.append(f"# {ls['matchup']} — {game['weekday']} {game['gameday']} {game['gametime']} ET "
              f"(Wk {int(game['week'])})")
@@ -237,16 +269,20 @@ def build_dossier(df, game):
     if aqb.get("note"):
         o.append(f"- _{aqb['note']}_")
     else:
-        o += [_recline("Career", aqb["career"]), _recline("As road QB", aqb["as_away"]),
-              _recline("Off bye", aqb["off_bye"]), _recline("Short week", aqb["short_week"]),
-              _recline("Last 10", aqb["last_10"])]
+        o.append(_recline(f"THIS SPOT ({aqb['this_spot_label']})", aqb["this_spot"]))
+        o.append("- _career reference splits (not tonight's spot):_")
+        o += [_recline("  Career", aqb["career"]), _recline("  As road QB", aqb["as_away"]),
+              _recline("  Off a bye", aqb["off_bye"]), _recline("  Short week", aqb["short_week"]),
+              _recline("  Last 10", aqb["last_10"])]
     o.append(f"\n**QB {game['home_team']} — {hqb.get('qb')}**")
     if hqb.get("note"):
         o.append(f"- _{hqb['note']}_")
     else:
-        o += [_recline("Career", hqb["career"]), _recline("As home QB", hqb["as_home"]),
-              _recline("Off bye", hqb["off_bye"]), _recline("Short week", hqb["short_week"]),
-              _recline("Last 10", hqb["last_10"])]
+        o.append(_recline(f"THIS SPOT ({hqb['this_spot_label']})", hqb["this_spot"]))
+        o.append("- _career reference splits (not tonight's spot):_")
+        o += [_recline("  Career", hqb["career"]), _recline("  As home QB", hqb["as_home"]),
+              _recline("  Off a bye", hqb["off_bye"]), _recline("  Short week", hqb["short_week"]),
+              _recline("  Last 10", hqb["last_10"])]
     o.append("\n**Head-to-head**")
     if h2h["n"] == 0:
         o.append("- none in dataset")
