@@ -202,6 +202,8 @@ def main():
     p.add_argument("--days", type=int, default=0, help="include this many days after --date")
     p.add_argument("--year", type=int)
     p.add_argument("--season-type", default="regular")
+    p.add_argument("--top", type=int, default=0,
+                   help="keep only the N highest-quality games (by combined SP+); 0 = all")
     p.add_argument("--out", default="reports_cfb/")
     a = p.parse_args()
 
@@ -232,8 +234,24 @@ def main():
         print(f"NO_GAMES: no CFB games {base}..{end} (season {year}).")
         return 0
 
+    total_found = len(sel)
+    if a.top and len(sel) > a.top:
+        sp = season["sp"]
+
+        def _score(item):
+            gm = item[1]
+            h = g(gm, "homeTeam", "home_team")
+            aw = g(gm, "awayTeam", "away_team")
+            hr = g(sp.get(h) or {}, "rating", default=-25)
+            ar = g(sp.get(aw) or {}, "rating", default=-25)
+            return (hr or -25) + (ar or -25)  # higher combined SP+ = better game
+
+        sel = sorted(sel, key=_score, reverse=True)[:a.top]
+        sel.sort(key=lambda x: x[0])
+
     os.makedirs(a.out, exist_ok=True)
-    print(f"EdgeBot CFB — {len(sel)} game(s), {base}..{end}, season {year}\n")
+    shown = f"top {len(sel)} of {total_found}" if a.top and total_found > len(sel) else f"{len(sel)} game(s)"
+    print(f"EdgeBot CFB — {shown}, {base}..{end}, season {year}\n")
     for _, gm in sel:
         text, gid, slug = build_dossier(season, gm)
         path = os.path.join(a.out, f"{gid or slug}.md")
