@@ -20,6 +20,151 @@ import sys
 
 import pandas as pd
 
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+try:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    _ET = None
+
+# Home-stadium coordinates (city/stadium level is fine for a game-time read).
+# Dome/closed games are skipped before this is used, so indoor coords are
+# harmless if present.
+NFL_STADIUM_COORDS = {
+    "ARI": (33.5277, -112.2626), "ATL": (33.7554, -84.4009), "BAL": (39.2780, -76.6227),
+    "BUF": (42.7738, -78.7870), "CAR": (35.2258, -80.8528), "CHI": (41.8623, -87.6167),
+    "CIN": (39.0954, -84.5160), "CLE": (41.5061, -81.6995), "DAL": (32.7473, -97.0945),
+    "DEN": (39.7439, -105.0201), "DET": (42.3400, -83.0456), "GB": (44.5013, -88.0622),
+    "HOU": (29.6847, -95.4107), "IND": (39.7601, -86.1639), "JAX": (30.3240, -81.6373),
+    "KC": (39.0489, -94.4839), "LV": (36.0909, -115.1833), "LAC": (33.9535, -118.3392),
+    "LA": (33.9535, -118.3392), "MIA": (25.9580, -80.2389), "MIN": (44.9736, -93.2575),
+    "NE": (42.0909, -71.2643), "NO": (29.9511, -90.0812), "NYG": (40.8135, -74.0745),
+    "NYJ": (40.8135, -74.0745), "PHI": (39.9008, -75.1675), "PIT": (40.4468, -80.0158),
+    "SEA": (47.5952, -122.3316), "SF": (37.4030, -121.9697), "TB": (27.9759, -82.5033),
+    "TEN": (36.1665, -86.7713), "WAS": (38.9076, -76.8645),
+}
+_NWS_HDRS = {"User-Agent": "edgebot/1.0 (research; contact via github 0xsu3ks)",
+             "Accept": "application/geo+json"}
+
+
+def fetch_weather(game):
+    """Game-time forecast via NWS (api.weather.gov, no key). Fail-safe: any
+    problem returns a short 'unavailable' note and never raises."""
+    roof = str(game.get("roof")).lower()
+    if roof in ("dome", "closed", "indoor"):
+        return {"relevant": False, "text": "indoor — weather n/a"}
+    if requests is None:
+        return {"relevant": True, "text": "forecast unavailable (requests missing)"}
+    coords = NFL_STADIUM_COORDS.get(game.get("home_team"))
+    if not coords:
+        return {"relevant": True, "text": "forecast unavailable (no stadium coords)"}
+    try:
+        pt = requests.get(f"https://api.weather.gov/points/{coords[0]},{coords[1]}",
+                          headers=_NWS_HDRS, timeout=12)
+        if pt.status_code != 200:
+            return {"relevant": True, "text": f"forecast unavailable (points {pt.status_code})"}
+        hurl = pt.json()["properties"]["forecastHourly"]
+        periods = requests.get(hurl, headers=_NWS_HDRS, timeout=12).json()["properties"]["periods"]
+        # kickoff as an aware datetime in ET, then nearest hourly period
+        kick = dt.datetime.fromisoformat(f"{game['gameday']}T{game['gametime']}:00")
+        if _ET is not None:
+            kick = kick.replace(tzinfo=_ET)
+        best, bestdiff = None, None
+        for p in periods:
+            try:
+                ts = dt.datetime.fromisoformat(p["startTime"])
+            except Exception:
+                continue
+            diff = abs((ts - kick).total_seconds()) if kick.tzinfo else None
+            if diff is None:
+                best = p
+                break
+            if bestdiff is None or diff < bestdiff:
+                best, bestdiff = p, diff
+        if not best:
+            return {"relevant": True, "text": "forecast unavailable (no matching hour)"}
+        pop = (best.get("probabilityOfPrecipitation") or {}).get("value")
+        return {
+            "relevant": True,
+            "temp": best.get("temperature"), "temp_unit": best.get("temperatureUnit", "F"),
+            "wind": best.get("windSpeed"), "wind_dir": best.get("windDirection"),
+            "precip_pct": pop, "sky": best.get("shortForecast"),
+            "text": f"{best.get('temperature')}°{best.get('temperatureUnit','F')}, "
+                    f"wind {best.get('windSpeed')} {best.get('windDirection','')}, "
+                    f"{'' if pop is None else str(pop)+'% precip, '}{best.get('shortForecast','')}",
+        }
+    except Exception as e:  # never break the brief over weather
+        return {"relevant": True, "text": f"forecast unavailable ({type(e).__name__})"}
+
+
+NFL_FULLNAME = {
+    "ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens",
+    "BUF": "Buffalo Bills", "CAR": "Carolina Panthers", "CHI": "Chicago Bears",
+    "CIN": "Cincinnati Bengals", "CLE": "Cleveland Browns", "DAL": "Dallas Cowboys",
+    "DEN": "Denver Broncos", "DET": "Detroit Lions", "GB": "Green Bay Packers",
+    "HOU": "Houston Texans", "IND": "Indianapolis Colts", "JAX": "Jacksonville Jaguars",
+    "KC": "Kansas City Chiefs", "LV": "Las Vegas Raiders", "LAC": "Los Angeles Chargers",
+    "LA": "Los Angeles Rams", "MIA": "Miami Dolphins", "MIN": "Minnesota Vikings",
+    "NE": "New England Patriots", "NO": "New Orleans Saints", "NYG": "New York Giants",
+    "NYJ": "New York Jets", "PHI": "Philadelphia Eagles", "PIT": "Pittsburgh Steelers",
+    "SEA": "Seattle Seahawks", "SF": "San Francisco 49ers", "TB": "Tampa Bay Buccaneers",
+    "TEN": "Tennessee Titans", "WAS": "Washington Commanders",
+}
+FULLNAME_TO_ABBR = {v: k for k, v in NFL_FULLNAME.items()}
+
+
+def _summ(vals):
+    if not vals:
+        return None
+    s = sorted(vals)
+    n = len(s)
+    med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    return {"consensus": round(med, 1), "min": min(s), "max": max(s), "n": n}
+
+
+def fetch_all_odds():
+    """LIVE odds for the whole slate from The Odds API (one request). Returns a
+    dict keyed by (home_abbr, away_abbr). Fail-safe: {} if no key, {'_error':..}
+    on failure. ODDS_API_KEY must be set and api.the-odds-api.com allowlisted."""
+    key = os.environ.get("ODDS_API_KEY")
+    if not key:
+        return {"_status": "no_key"}
+    if requests is None:
+        return {"_error": "requests missing"}
+    try:
+        r = requests.get(
+            "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds",
+            params={"apiKey": key, "regions": "us", "markets": "spreads,totals",
+                    "oddsFormat": "american"}, timeout=20)
+        if r.status_code != 200:
+            return {"_error": f"HTTP {r.status_code}"}
+        out = {"_fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+               "_remaining": r.headers.get("x-requests-remaining")}
+        for ev in r.json():
+            ha = FULLNAME_TO_ABBR.get(ev.get("home_team"))
+            aa = FULLNAME_TO_ABBR.get(ev.get("away_team"))
+            if not ha or not aa:
+                continue
+            hsp, tot = [], []
+            for bk in ev.get("bookmakers", []):
+                for m in bk.get("markets", []):
+                    if m.get("key") == "spreads":
+                        for o in m.get("outcomes", []):
+                            if FULLNAME_TO_ABBR.get(o.get("name")) == ha and o.get("point") is not None:
+                                hsp.append(o["point"])
+                    elif m.get("key") == "totals":
+                        for o in m.get("outcomes", []):
+                            if o.get("name") == "Over" and o.get("point") is not None:
+                                tot.append(o["point"])
+            out[(ha, aa)] = {"home_spread": _summ(hsp), "total": _summ(tot),
+                             "n_books": len(ev.get("bookmakers", []))}
+        return out
+    except Exception as e:
+        return {"_error": type(e).__name__}
+
 RAW_URL = "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
 
 STR_COLS = ("referee", "away_qb_name", "home_qb_name", "away_coach", "home_coach")
@@ -248,7 +393,19 @@ def _recline(label, rec):
     return f"- **{label}:** " + " · ".join(bits)
 
 
-def build_dossier(df, game):
+def _odds_line(od, home, fetched):
+    def _rng(x, sign):
+        if not x:
+            return "n/a"
+        fmt = "+g" if sign else "g"
+        return (f"{format(x['consensus'], fmt)} "
+                f"(books {format(x['min'], fmt)}..{format(x['max'], fmt)}, n={x['n']})")
+    return (f"**LIVE ODDS @ {fetched}** ({od.get('n_books')} books) — USE THIS FOR THE PICK: "
+            f"{home} spread {_rng(od.get('home_spread'), True)} · "
+            f"total {_rng(od.get('total'), False)}")
+
+
+def build_dossier(df, game, odds_map=None):
     pl = played(df)
     pl = pl[pl["gameday"] < game["gameday"]]  # no leakage
     ls = line_summary(game)
@@ -260,7 +417,20 @@ def build_dossier(df, game):
     o = []
     o.append(f"# {ls['matchup']} — {game['weekday']} {game['gameday']} {game['gametime']} ET "
              f"(Wk {int(game['week'])})")
-    o.append(f"**Line:** {ls['spread']} | **Total:** {ls['total']} | "
+    # Live odds (fetched once per run, passed in) take priority for the pick.
+    od = None
+    if odds_map:
+        if odds_map.get("_status") == "no_key":
+            o.append("**LIVE ODDS:** not fetched (ODDS_API_KEY not set) — pick must use the reference line below and say so.")
+        elif odds_map.get("_error"):
+            o.append(f"**LIVE ODDS:** unavailable ({odds_map['_error']}) — pick must use the reference line below and say so.")
+        else:
+            od = odds_map.get((game["home_team"], game["away_team"]))
+            if od:
+                o.append(_odds_line(od, game["home_team"], odds_map.get("_fetched_at", "run time")))
+            else:
+                o.append("**LIVE ODDS:** no matching event returned — pick uses the reference line below.")
+    o.append(f"**Reference line (nflverse, may be stale):** {ls['spread']} | total {ls['total']} | "
              f"ML {game['away_team']} {ls['away_ml']} ({ls['away_imp']}%) / "
              f"{game['home_team']} {ls['home_ml']} ({ls['home_imp']}%)")
     o.append(f"**Venue:** {ls['stadium']} · {ls['roof']} · {ls['surface']}")
@@ -292,12 +462,12 @@ def build_dossier(df, game):
     o.append("\n**Referee**")
     o.append(f"- {ref.get('ref')}: " + (ref["note"] if ref.get("games", 0) == 0 else
              f"{ref['games']}g, over {ref['over_rate']}%, avg {ref['avg_total']} pts, home ATS {ref['home_ats_pct']}%"))
-    roof = str(ls["roof"]).lower()
-    if roof in ("dome", "closed", "indoor", "retractable"):
+    wx = fetch_weather(game)
+    if not wx.get("relevant"):
         o.append("\n**Weather:** indoor — n/a")
     else:
-        o.append("\n**Weather:** OUTDOOR — live game-time forecast NOT wired (needs weather API host allowlisted)")
-    o.append("\n_Data: nflverse. No wager placed or recommended — data points only._")
+        o.append(f"\n**Weather (game-time forecast):** {wx['text']}")
+    o.append("\n_Data: nflverse + NWS + The Odds API. Any pick is an opinion from historical data, not a placed wager or financial advice._")
     return "\n".join(o)
 
 
@@ -326,10 +496,12 @@ def main():
         print(f"NO_GAMES: no NFL games with posted lines {base}..{end} (season {season}).")
         return 0
 
+    odds_map = fetch_all_odds()
     os.makedirs(a.out, exist_ok=True)
-    print(f"EdgeBot brief — {len(g)} game(s), {base}..{end}, season {season}\n")
+    status = odds_map.get("_status") or odds_map.get("_error") or f"live ({odds_map.get('_remaining','?')} reqs left)"
+    print(f"EdgeBot brief — {len(g)} game(s), {base}..{end}, season {season} · odds: {status}\n")
     for _, r in g.iterrows():
-        text = build_dossier(df, r)
+        text = build_dossier(df, r, odds_map)
         path = os.path.join(a.out, f"{r['game_id']}.md")
         with open(path, "w") as f:
             f.write(text)
