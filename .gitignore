@@ -1,0 +1,10 @@
+# cached data (refetched at runtime)
+data/*.csv
+# generated dossiers
+reports/*.md
+# python
+__pycache__/
+*.pyc
+.venv/
+# secrets
+.env
