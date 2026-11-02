@@ -405,7 +405,53 @@ def _odds_line(od, home, fetched):
             f"total {_rng(od.get('total'), False)}")
 
 
-def build_dossier(df, game, odds_map=None):
+_ESPN_TO_NFLVERSE = {"WSH": "WAS", "LAR": "LA"}  # ESPN abbr -> nflverse abbr
+
+
+def _espn_team_key(abbr, disp):
+    if abbr:
+        a = abbr.upper()
+        return _ESPN_TO_NFLVERSE.get(a, a)
+    if disp:
+        return FULLNAME_TO_ABBR.get(disp)
+    return None
+
+
+def fetch_all_injuries():
+    """League-wide injuries from ESPN (one request). {abbr: [ "Name (POS) — status" ]}.
+    Fail-safe: {'_error':..} / {'_status':'empty'} never raises. Needs
+    site.api.espn.com allowlisted; no key."""
+    if requests is None:
+        return {"_error": "requests missing"}
+    try:
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        if r.status_code != 200:
+            return {"_error": f"HTTP {r.status_code}"}
+        data = r.json()
+        actionable = {"out", "doubtful", "questionable"}
+        out = {}
+        for grp in (data.get("injuries") or []):
+            t = grp.get("team") or {}
+            key = _espn_team_key(grp.get("abbreviation") or t.get("abbreviation"),
+                                 grp.get("displayName") or t.get("displayName") or grp.get("name"))
+            lst = []
+            for it in (grp.get("injuries") or []):
+                st = (it.get("status") or (it.get("type") or {}).get("description") or "").strip()
+                if st.lower() not in actionable:
+                    continue  # skip IR / day-to-day / season-long; keep game-status only
+                ath = it.get("athlete") or {}
+                nm = ath.get("displayName") or ath.get("shortName") or "?"
+                pos = (ath.get("position") or {}).get("abbreviation") or ""
+                lst.append(f"{nm} ({pos}) — {st}".replace(" ()", ""))
+            if key:
+                out[key] = lst
+        return out or {"_status": "empty"}
+    except Exception as e:
+        return {"_error": type(e).__name__}
+
+
+def build_dossier(df, game, odds_map=None, inj_map=None):
     pl = played(df)
     pl = pl[pl["gameday"] < game["gameday"]]  # no leakage
     ls = line_summary(game)
@@ -462,6 +508,21 @@ def build_dossier(df, game, odds_map=None):
     o.append("\n**Referee**")
     o.append(f"- {ref.get('ref')}: " + (ref["note"] if ref.get("games", 0) == 0 else
              f"{ref['games']}g, over {ref['over_rate']}%, avg {ref['avg_total']} pts, home ATS {ref['home_ats_pct']}%"))
+    o.append("\n**Injuries (ESPN)**")
+    if inj_map is None:
+        o.append("- not fetched")
+    elif inj_map.get("_error"):
+        o.append(f"- unavailable ({inj_map['_error']})")
+    elif inj_map.get("_status") == "empty":
+        o.append("- none reported leaguewide")
+    else:
+        for team in (game["away_team"], game["home_team"]):
+            lst = inj_map.get(team) or []
+            if lst:
+                o.append(f"- {team}: " + "; ".join(lst[:8]) + (" …" if len(lst) > 8 else ""))
+            else:
+                o.append(f"- {team}: none reported")
+
     wx = fetch_weather(game)
     if not wx.get("relevant"):
         o.append("\n**Weather:** indoor — n/a")
@@ -497,11 +558,13 @@ def main():
         return 0
 
     odds_map = fetch_all_odds()
+    inj_map = fetch_all_injuries()
     os.makedirs(a.out, exist_ok=True)
     status = odds_map.get("_status") or odds_map.get("_error") or f"live ({odds_map.get('_remaining','?')} reqs left)"
-    print(f"EdgeBot brief — {len(g)} game(s), {base}..{end}, season {season} · odds: {status}\n")
+    injst = inj_map.get("_error") or inj_map.get("_status") or f"{len([k for k in inj_map if not k.startswith('_')])} teams"
+    print(f"EdgeBot brief — {len(g)} game(s), {base}..{end}, season {season} · odds: {status} · injuries: {injst}\n")
     for _, r in g.iterrows():
-        text = build_dossier(df, r, odds_map)
+        text = build_dossier(df, r, odds_map, inj_map)
         path = os.path.join(a.out, f"{r['game_id']}.md")
         with open(path, "w") as f:
             f.write(text)
