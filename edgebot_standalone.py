@@ -600,8 +600,9 @@ def build_dossier(df, game, odds_map=None, inj_map=None, srs_map=None):
         hs, aw = srs_map.get(game["home_team"]), srs_map.get(game["away_team"])
         if hs is not None and aw is not None:
             implied = round(hs - aw + 2.0, 1)  # +2.0 generic home-field
+            fav_t, fav_by = (game["home_team"], implied) if implied >= 0 else (game["away_team"], round(-implied, 1))
             o.append(f"**Power rating (SRS, margin+SOS):** {game['home_team']} {hs:+g} vs "
-                     f"{game['away_team']} {aw:+g} → SRS sees {game['home_team']} by ~{implied} (incl 2.0 HFA)")
+                     f"{game['away_team']} {aw:+g} → SRS sees {fav_t} by ~{fav_by} (incl 2.0 HFA)")
 
     # Context: division game, spread on a key number
     ctx = []

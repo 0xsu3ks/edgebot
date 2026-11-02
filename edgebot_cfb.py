@@ -269,10 +269,11 @@ def build_dossier(season, gm):
     if sp:
         hfa = 0 if neutral else 2.5
         implied = round(sp["diff"] + hfa, 1)
+        fav_team, fav_by = (home, implied) if implied >= 0 else (away, round(-implied, 1))
         hr = f"#{sp['home_rank']} " if sp.get("home_rank") else ""
         ar = f"#{sp['away_rank']} " if sp.get("away_rank") else ""
         o.append(f"**SP+ power:** {hr}{home} {sp['home_rating']} vs {ar}{away} {sp['away_rating']} "
-                 f"→ SP+ sees {home} by ~{implied} (incl {hfa} HFA)")
+                 f"→ SP+ sees {fav_team} by ~{fav_by} (incl {hfa} HFA)")
     else:
         o.append("**SP+ power:** unavailable")
     o.append(f"**Records:** {away} {arec['overall'] if arec else '?'} "
