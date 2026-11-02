@@ -145,7 +145,7 @@ def _recent_form(games, team, before_date, n=3):
             res = "W" if ap > hp else ("L" if ap < hp else "T")
             played.append((d, f"{res} @ {ht} {int(ap)}-{int(hp)}"))
     played.sort()
-    return [s for _, s in played[-n:]]
+    return [f"{d}: {s}" for d, s in played[-n:]]
 
 
 # ---------- dossier -------------------------------------------------------
