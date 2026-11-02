@@ -13,9 +13,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import math
 import os
+import re
 import sys
 
 import pandas as pd
@@ -87,8 +89,10 @@ def fetch_weather(game):
         if not best:
             return {"relevant": True, "text": "forecast unavailable (no matching hour)"}
         pop = (best.get("probabilityOfPrecipitation") or {}).get("value")
+        wnums = re.findall(r"\d+", str(best.get("windSpeed") or ""))
+        wind_mph = max(int(n) for n in wnums) if wnums else None
         return {
-            "relevant": True,
+            "relevant": True, "wind_mph": wind_mph,
             "temp": best.get("temperature"), "temp_unit": best.get("temperatureUnit", "F"),
             "wind": best.get("windSpeed"), "wind_dir": best.get("windDirection"),
             "precip_pct": pop, "sky": best.get("shortForecast"),
@@ -393,6 +397,72 @@ def _recline(label, rec):
     return f"- **{label}:** " + " · ".join(bits)
 
 
+TEAM_TZ = {
+    "ATL": "America/New_York", "BAL": "America/New_York", "BUF": "America/New_York",
+    "CAR": "America/New_York", "CIN": "America/New_York", "CLE": "America/New_York",
+    "DET": "America/New_York", "IND": "America/New_York", "JAX": "America/New_York",
+    "MIA": "America/New_York", "NE": "America/New_York", "NYG": "America/New_York",
+    "NYJ": "America/New_York", "PHI": "America/New_York", "PIT": "America/New_York",
+    "TB": "America/New_York", "WAS": "America/New_York",
+    "CHI": "America/Chicago", "DAL": "America/Chicago", "GB": "America/Chicago",
+    "HOU": "America/Chicago", "KC": "America/Chicago", "MIN": "America/Chicago",
+    "NO": "America/Chicago", "TEN": "America/Chicago",
+    "DEN": "America/Denver", "ARI": "America/Phoenix",
+    "LV": "America/Los_Angeles", "LAC": "America/Los_Angeles", "LA": "America/Los_Angeles",
+    "SF": "America/Los_Angeles", "SEA": "America/Los_Angeles",
+}
+
+
+def compute_travel(game):
+    """Travel + body-clock angle for the ROAD team. Fail-safe -> None."""
+    if _ET is None:
+        return None
+    htz, atz = TEAM_TZ.get(game["home_team"]), TEAM_TZ.get(game["away_team"])
+    if not htz or not atz:
+        return None
+    try:
+        kick = dt.datetime.fromisoformat(f"{game['gameday']}T{game['gametime']}:00").replace(tzinfo=_ET)
+        local = kick.astimezone(ZoneInfo(htz))     # actual stadium local time
+        body = kick.astimezone(ZoneInfo(atz))       # road team's body clock
+        zones = round((local.utcoffset() - body.utcoffset()).total_seconds() / 3600)
+        bh = body.hour + body.minute / 60.0
+        notes = []
+        if zones == 0:
+            notes.append(f"{game['away_team']} in-zone (no TZ change)")
+        else:
+            direction = "EAST" if zones > 0 else "WEST"
+            notes.append(f"{game['away_team']} travels {abs(zones)} TZ {direction}; "
+                         f"body-clock kickoff ~{body.strftime('%-I:%M%p').lower()}")
+            if zones >= 2 and bh < 11:
+                notes.append("⚠ early body clock for road team (West→East early window — historically underperforms)")
+            if kick.hour >= 20 and atz == "America/Los_Angeles":
+                notes.append("West-coast road team in a night game — body clock still afternoon (slight edge)")
+        return {"zones": zones, "body_hour": round(bh, 1), "notes": notes}
+    except Exception:
+        return None
+
+
+def compute_srs(df, season, cap=24, iters=20):
+    """Simple Rating System (avg scoring margin adjusted for strength of schedule),
+    a power rating computed purely from this season's scores. {team: rating}."""
+    gm = df[(df["season"] == season) & df["result"].notna()]
+    if gm.empty:
+        return {}
+    opps = collections.defaultdict(list)
+    for _, r in gm.iterrows():
+        m = max(-cap, min(cap, float(r["result"])))  # cap blowouts
+        opps[r["home_team"]].append((r["away_team"], m))
+        opps[r["away_team"]].append((r["home_team"], -m))
+    teams = list(opps)
+    avg = {t: sum(x for _, x in opps[t]) / len(opps[t]) for t in teams}
+    srs = dict(avg)
+    for _ in range(iters):
+        nxt = {t: avg[t] + sum(srs[o] for o, _ in opps[t]) / len(opps[t]) for t in teams}
+        mean = sum(nxt.values()) / len(nxt)
+        srs = {t: nxt[t] - mean for t in teams}
+    return {t: round(v, 1) for t, v in srs.items()}
+
+
 def _odds_line(od, home, fetched):
     def _rng(x, sign):
         if not x:
@@ -451,7 +521,7 @@ def fetch_all_injuries():
         return {"_error": type(e).__name__}
 
 
-def build_dossier(df, game, odds_map=None, inj_map=None):
+def build_dossier(df, game, odds_map=None, inj_map=None, srs_map=None):
     pl = played(df)
     pl = pl[pl["gameday"] < game["gameday"]]  # no leakage
     ls = line_summary(game)
@@ -481,6 +551,37 @@ def build_dossier(df, game, odds_map=None, inj_map=None):
              f"{game['home_team']} {ls['home_ml']} ({ls['home_imp']}%)")
     o.append(f"**Venue:** {ls['stadium']} · {ls['roof']} · {ls['surface']}")
     o.append(f"**Rest:** {rest['away'][0]} {rest['away'][1]} | {rest['home'][0]} {rest['home'][1]} → {rest['note']}")
+
+    # Travel / body clock (road team)
+    tv = compute_travel(game)
+    if tv and tv["notes"]:
+        o.append("**Travel / body clock:** " + " · ".join(tv["notes"]))
+
+    # Power rating (SRS): margin + strength of schedule, vs the number
+    if srs_map:
+        hs, aw = srs_map.get(game["home_team"]), srs_map.get(game["away_team"])
+        if hs is not None and aw is not None:
+            implied = round(hs - aw + 2.0, 1)  # +2.0 generic home-field
+            o.append(f"**Power rating (SRS, margin+SOS):** {game['home_team']} {hs:+g} vs "
+                     f"{game['away_team']} {aw:+g} → SRS sees {game['home_team']} by ~{implied} (incl 2.0 HFA)")
+
+    # Context: division game, spread on a key number
+    ctx = []
+    if game.get("div_game") in (1, 1.0, True):
+        ctx.append("division game")
+    spabs = None
+    if od and od.get("home_spread"):
+        spabs = abs(od["home_spread"]["consensus"])
+    elif not pd.isna(game["spread_line"]):
+        spabs = abs(float(game["spread_line"]))
+    if spabs is not None:
+        for kn in (3, 7, 10, 14):
+            if abs(spabs - kn) <= 0.5:
+                ctx.append(f"spread sits on key number {kn}")
+                break
+    if ctx:
+        o.append("**Context:** " + " · ".join(ctx))
+
     o.append(f"\n**QB {game['away_team']} — {aqb.get('qb')}**")
     if aqb.get("note"):
         o.append(f"- _{aqb['note']}_")
@@ -518,6 +619,9 @@ def build_dossier(df, game, odds_map=None, inj_map=None):
     else:
         for team in (game["away_team"], game["home_team"]):
             lst = inj_map.get(team) or []
+            qbs = [x for x in lst if "(QB)" in x]
+            if qbs:
+                o.append(f"- ⚠ {team} QB: " + "; ".join(qbs))
             if lst:
                 o.append(f"- {team}: " + "; ".join(lst[:8]) + (" …" if len(lst) > 8 else ""))
             else:
@@ -527,7 +631,11 @@ def build_dossier(df, game, odds_map=None, inj_map=None):
     if not wx.get("relevant"):
         o.append("\n**Weather:** indoor — n/a")
     else:
-        o.append(f"\n**Weather (game-time forecast):** {wx['text']}")
+        wline = f"\n**Weather (game-time forecast):** {wx['text']}"
+        wmph = wx.get("wind_mph")
+        if wmph is not None and wmph >= 15:
+            wline += f"  ⚠ WIND {wmph} mph — strong Under signal (degrades passing & kicking)"
+        o.append(wline)
     o.append("\n_Data: nflverse + NWS + The Odds API. Any pick is an opinion from historical data, not a placed wager or financial advice._")
     return "\n".join(o)
 
@@ -559,12 +667,13 @@ def main():
 
     odds_map = fetch_all_odds()
     inj_map = fetch_all_injuries()
+    srs_map = compute_srs(df, season)
     os.makedirs(a.out, exist_ok=True)
     status = odds_map.get("_status") or odds_map.get("_error") or f"live ({odds_map.get('_remaining','?')} reqs left)"
     injst = inj_map.get("_error") or inj_map.get("_status") or f"{len([k for k in inj_map if not k.startswith('_')])} teams"
     print(f"EdgeBot brief — {len(g)} game(s), {base}..{end}, season {season} · odds: {status} · injuries: {injst}\n")
     for _, r in g.iterrows():
-        text = build_dossier(df, r, odds_map, inj_map)
+        text = build_dossier(df, r, odds_map, inj_map, srs_map)
         path = os.path.join(a.out, f"{r['game_id']}.md")
         with open(path, "w") as f:
             f.write(text)
