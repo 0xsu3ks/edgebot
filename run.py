@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import os
 import sys
 
@@ -46,6 +47,35 @@ def cmd_slate(args):
         _emit(text, args.out, r["game_id"])
 
 
+def cmd_brief(args):
+    """Scheduled-run entrypoint: pick unplayed games on a date window, build a
+    dossier for each. Auto-detects the current season. Date defaults to today
+    (America/New_York) so an 8am-ET run targets that day's games."""
+    df = D.load_games(force_refresh=True)  # scheduled runs always want fresh data
+    # current season = latest season that still has unplayed games
+    unplayed_all = df[df["away_score"].isna()]
+    season = args.season or int(unplayed_all["season"].max())
+
+    try:
+        base = (dt.date.fromisoformat(args.date) if args.date
+                else dt.datetime.now(dt.timezone(dt.timedelta(hours=-5))).date())
+    except ValueError:
+        print(f"bad --date: {args.date}"); return
+    end = base + dt.timedelta(days=args.days)
+
+    g = D.upcoming_games(df, season=season)
+    g = g[(g["gameday"] >= base.isoformat()) & (g["gameday"] <= end.isoformat())]
+    if g.empty:
+        print(f"No NFL games with posted lines {base}..{end} (season {season}).")
+        return
+    print(f"EdgeBot brief — {len(g)} game(s), {base}..{end}, season {season}\n")
+    for _, r in g.iterrows():
+        text = DOS.build_dossier(df, r["game_id"])
+        _emit(text, args.out, r["game_id"])
+        if args.out:
+            print(f"  - {r['away_team']}@{r['home_team']}  ({r['gameday']})")
+
+
 def _emit(text: str, out: str | None, game_id: str):
     if out:
         os.makedirs(out, exist_ok=True)
@@ -66,9 +96,12 @@ def main():
     pg = sub.add_parser("game"); pg.add_argument("game_id"); pg.add_argument("--out")
     ps = sub.add_parser("slate"); ps.add_argument("--season", type=int, required=True)
     ps.add_argument("--week", type=int, required=True); ps.add_argument("--out")
+    pb = sub.add_parser("brief"); pb.add_argument("--date", help="YYYY-MM-DD (default: today ET)")
+    pb.add_argument("--days", type=int, default=0, help="include this many days after --date")
+    pb.add_argument("--season", type=int); pb.add_argument("--out", default="reports/")
 
     args = p.parse_args()
-    {"list": cmd_list, "game": cmd_game, "slate": cmd_slate}[args.cmd](args)
+    {"list": cmd_list, "game": cmd_game, "slate": cmd_slate, "brief": cmd_brief}[args.cmd](args)
 
 
 if __name__ == "__main__":
