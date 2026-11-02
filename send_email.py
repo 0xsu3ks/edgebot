@@ -25,7 +25,7 @@ try:
 except Exception:
     requests = None
 
-FROM = os.environ.get("EDGEBOT_EMAIL_FROM", "EdgeBot <onboarding@resend.dev>")
+FROM = os.environ.get("EDGEBOT_EMAIL_FROM", "EdgeBot <noreply@edgebot.suckiel.com>")
 TO = os.environ.get("EDGEBOT_EMAIL_TO", "kevin@suckiel.com")
 
 
