@@ -26,7 +26,13 @@ except Exception:
     requests = None
 
 FROM = os.environ.get("EDGEBOT_EMAIL_FROM", "EdgeBot <noreply@edgebot.suckiel.com>")
+# EDGEBOT_EMAIL_TO may be a comma/space/semicolon-separated list. The first is the
+# visible To:, any others are BCC'd so recipients can't see each other / reply-all.
 TO = os.environ.get("EDGEBOT_EMAIL_TO", "kevin@suckiel.com")
+
+
+def _recipients(s):
+    return [x.strip() for x in re.split(r"[,;\s]+", s or "") if x.strip()]
 
 
 def md_to_html(md: str) -> str:
@@ -92,14 +98,19 @@ def main():
     except Exception as e:
         print(f"ERROR: cannot read {a.file}: {e}"); return 2
 
+    rcpts = _recipients(a.to)
+    if not rcpts:
+        print("ERROR: no recipients"); return 2
+    payload = {"from": FROM, "to": [rcpts[0]], "subject": a.subject, "html": md_to_html(md)}
+    if len(rcpts) > 1:
+        payload["bcc"] = rcpts[1:]
     try:
         r = requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"from": FROM, "to": [a.to], "subject": a.subject, "html": md_to_html(md)},
-            timeout=20)
+            json=payload, timeout=20)
         if r.status_code in (200, 201):
-            print(f"OK: emailed {a.to} (id {r.json().get('id','?')})")
+            print(f"OK: emailed {len(rcpts)} recipient(s) [{', '.join(rcpts)}] (id {r.json().get('id','?')})")
             return 0
         print(f"ERROR: Resend HTTP {r.status_code}: {r.text[:200]}")
         return 2
